@@ -5,8 +5,10 @@ Access Polymarket markets, events, positions, trades, prices, and order books.
 """
 
 import os
+import time
+from typing import Optional, List, Dict, Any, Tuple
+
 import requests
-from typing import Optional, List, Dict, Any
 
 
 class PolymarketClient:
@@ -35,11 +37,38 @@ class PolymarketClient:
     SHARE_DECIMALS = 8
     USDC_DECIMALS = 6
     
-    def __init__(self, api_key: Optional[str] = None):
+    def __init__(self, api_key: Optional[str] = None, *, timeout: Tuple[float, float] = (5.0, 30.0), max_retries: int = 2):
         self.api_key = api_key
+        self.timeout = timeout
+        self.max_retries = max_retries
         self.session = requests.Session()
         if api_key:
             self.session.headers.update({"Authorization": f"Bearer {api_key}"})
+
+    def _request_json(self, method: str, url: str, *, params: Optional[Dict[str, Any]] = None, json: Any = None, timeout: Optional[Tuple[float, float]] = None) -> Any:
+        """HTTP helper with default timeout + small retry for transient failures."""
+        t = timeout or self.timeout
+        last_err: Optional[BaseException] = None
+        for attempt in range(self.max_retries + 1):
+            try:
+                resp = self.session.request(method, url, params=params, json=json, timeout=t)
+                resp.raise_for_status()
+                return resp.json()
+            except requests.HTTPError as e:
+                last_err = e
+                status = getattr(e.response, "status_code", None)
+                # Retry 429/5xx only (idempotent endpoints)
+                if status in (429, 500, 502, 503, 504) and attempt < self.max_retries:
+                    time.sleep(0.5 * (2 ** attempt))
+                    continue
+                raise
+            except (requests.Timeout, requests.ConnectionError) as e:
+                last_err = e
+                if attempt < self.max_retries:
+                    time.sleep(0.5 * (2 ** attempt))
+                    continue
+                raise
+        raise RuntimeError(f"request failed after retries: {last_err}")
     
     # ==================== MARKETS (Gamma API) ====================
     
@@ -74,32 +103,29 @@ class PolymarketClient:
         if cursor is not None:
             params["cursor"] = cursor
 
-        resp = self.session.get(f"{self.GAMMA_API}/markets", params=params)
-        resp.raise_for_status()
-        return resp.json()
+        return self._request_json("GET", f"{self.GAMMA_API}/markets", params=params)
     
-    def get_market(self, condition_id: str) -> Dict:
+    def get_market(self, condition_id: str) -> Optional[Dict[str, Any]]:
         """Get single market by condition ID."""
-        resp = self.session.get(f"{self.GAMMA_API}/markets", params={"conditionId": condition_id})
-        resp.raise_for_status()
-        data = resp.json()
+        data = self._request_json("GET", f"{self.GAMMA_API}/markets", params={"conditionId": condition_id})
         return data[0] if data else None
     
-    def get_market_by_slug(self, slug: str) -> Dict:
+    def get_market_by_slug(self, slug: str) -> Optional[Dict[str, Any]]:
         """Get market by slug."""
-        resp = self.session.get(f"{self.GAMMA_API}/markets", params={"slug": slug})
-        resp.raise_for_status()
-        data = resp.json()
+        data = self._request_json("GET", f"{self.GAMMA_API}/markets", params={"slug": slug})
         return data[0] if data else None
     
-    def search_markets(self, query: str, limit: int = 10) -> List[Dict]:
-        """Search markets by query."""
-        resp = self.session.get(
+    def search_markets(self, query: str, limit: int = 10) -> List[Dict[str, Any]]:
+        """Search markets by query (Gamma /markets?search=...).
+
+        Note: this is *not* the same as the public-search workflow; see
+        `search_markets_workflow` for higher-recall search.
+        """
+        return self._request_json(
+            "GET",
             f"{self.GAMMA_API}/markets",
-            params={"search": query, "limit": limit}
+            params={"search": query, "limit": limit},
         )
-        resp.raise_for_status()
-        return resp.json()
     
     # ==================== EVENTS (Gamma API) ====================
     
@@ -126,15 +152,11 @@ class PolymarketClient:
         if offset is not None:
             params["offset"] = offset
 
-        resp = self.session.get(f"{self.GAMMA_API}/events", params=params)
-        resp.raise_for_status()
-        return resp.json()
+        return self._request_json("GET", f"{self.GAMMA_API}/events", params=params)
     
     def get_event(self, event_id: str) -> Dict:
         """Get single event by ID."""
-        resp = self.session.get(f"{self.GAMMA_API}/events/{event_id}")
-        resp.raise_for_status()
-        return resp.json()
+        return self._request_json("GET", f"{self.GAMMA_API}/events/{event_id}")
     
     # ==================== PUBLIC SEARCH (NEW!) ====================
     
@@ -156,12 +178,11 @@ class PolymarketClient:
         Returns:
             Dict with 'events' (list), 'pagination' info
         """
-        resp = self.session.get(
+        return self._request_json(
+            "GET",
             f"{self.GAMMA_API}/public-search",
-            params={"q": query, "limit": limit}
+            params={"q": query, "limit": limit},
         )
-        resp.raise_for_status()
-        return resp.json()
     
     def search_markets_public(
         self,
@@ -191,7 +212,7 @@ class PolymarketClient:
         
         return markets
     
-    def search_markets(
+    def search_markets_workflow(
         self,
         query: str,
         active_only: bool = False,
@@ -276,7 +297,7 @@ class PolymarketClient:
         Print search results in a readable format.
         
         Args:
-            results: Output from search_markets()
+            results: Output from search_markets_workflow()
             show_details: Show volume, status for each market
         """
         summary = results["summary"]
@@ -388,9 +409,7 @@ class PolymarketClient:
             if end_ts:
                 params["endTs"] = end_ts
 
-            resp = self.session.get(f"{self.CLOB_API}/prices-history", params=params)
-            resp.raise_for_status()
-            return resp.json()
+            return self._request_json("GET", f"{self.CLOB_API}/prices-history", params=params)
 
         # Fetch minute-level, then resample.
         params = {
@@ -403,9 +422,7 @@ class PolymarketClient:
         if end_ts:
             params["endTs"] = end_ts
 
-        resp = self.session.get(f"{self.CLOB_API}/prices-history", params=params)
-        resp.raise_for_status()
-        raw = resp.json() or {}
+        raw = self._request_json("GET", f"{self.CLOB_API}/prices-history", params=params) or {}
 
         raw_hist = raw.get("history") or raw.get("data") or raw.get("prices") or []
         resampled = self._resample_price_history(raw_hist, target_fidelity=fidelity)
@@ -423,18 +440,16 @@ class PolymarketClient:
     
     def get_price(self, token_id: str) -> float:
         """Get current price for a token."""
-        resp = self.session.get(f"{self.CLOB_API}/price", params={"token_id": token_id})
-        resp.raise_for_status()
-        return resp.json().get("price", 0)
+        data = self._request_json("GET", f"{self.CLOB_API}/price", params={"token_id": token_id})
+        return (data or {}).get("price", 0)
     
     def get_prices(self, token_ids: List[str]) -> Dict[str, float]:
         """Get current prices for multiple tokens."""
-        resp = self.session.get(
+        return self._request_json(
+            "GET",
             f"{self.CLOB_API}/prices",
-            params={"token_ids": ",".join(token_ids)}
+            params={"token_ids": ",".join(token_ids)},
         )
-        resp.raise_for_status()
-        return resp.json()
     
     # ==================== FEES (CLOB API) ====================
 
@@ -450,9 +465,7 @@ class PolymarketClient:
         Raises:
           requests.HTTPError on non-2xx.
         """
-        resp = self.session.get(f"{self.CLOB_API}/fee-rate", params={"token_id": token_id})
-        resp.raise_for_status()
-        data = resp.json() or {}
+        data = self._request_json("GET", f"{self.CLOB_API}/fee-rate", params={"token_id": token_id}) or {}
         return int(data.get("base_fee") or 0)
 
     # ==================== ORDER BOOK (CLOB API) ====================
@@ -465,7 +478,7 @@ class PolymarketClient:
         Returns empty book if 404 or error.
         """
         try:
-            resp = self.session.get(f"{self.CLOB_API}/orderbook", params={"token_id": token_id})
+            resp = self.session.get(f"{self.CLOB_API}/orderbook", params={"token_id": token_id}, timeout=self.timeout)
             if resp.status_code == 404:
                 return {"bids": [], "asks": [], "error": "Orderbook not available"}
             resp.raise_for_status()
@@ -475,16 +488,15 @@ class PolymarketClient:
     
     def get_orderbooks(self, token_ids: List[str]) -> Dict[str, Dict]:
         """Get order books for multiple tokens."""
-        resp = self.session.get(
+        return self._request_json(
+            "GET",
             f"{self.CLOB_API}/orderbooks",
-            params={"token_ids": ",".join(token_ids)}
+            params={"token_ids": ",".join(token_ids)},
         )
-        resp.raise_for_status()
-        return resp.json()
     
     def get_midpoint(self, token_id: str) -> Optional[float]:
         """Get midpoint price."""
-        resp = self.session.get(f"{self.CLOB_API}/midpoint", params={"token_id": token_id})
+        resp = self.session.get(f"{self.CLOB_API}/midpoint", params={"token_id": token_id}, timeout=self.timeout)
         if resp.status_code == 404:
             return None
         resp.raise_for_status()
@@ -492,7 +504,7 @@ class PolymarketClient:
     
     def get_spread(self, token_id: str) -> Optional[Dict]:
         """Get bid-ask spread."""
-        resp = self.session.get(f"{self.CLOB_API}/spread", params={"token_id": token_id})
+        resp = self.session.get(f"{self.CLOB_API}/spread", params={"token_id": token_id}, timeout=self.timeout)
         if resp.status_code == 404:
             return None
         resp.raise_for_status()
@@ -530,49 +542,39 @@ class PolymarketClient:
         if end_date:
             params["endDate"] = end_date
         
-        resp = self.session.get(f"{self.DATA_API}/trades", params=params)
-        resp.raise_for_status()
-        return resp.json()
+        return self._request_json("GET", f"{self.DATA_API}/trades", params=params)
     
     # ==================== POSITIONS (Data API) ====================
     
     def get_positions(self, account: str) -> List[Dict]:
         """Get positions for an account."""
-        resp = self.session.get(f"{self.DATA_API}/positions", params={"account": account})
-        resp.raise_for_status()
-        return resp.json()
+        return self._request_json("GET", f"{self.DATA_API}/positions", params={"account": account})
     
     def get_position_history(self, account: str, limit: int = 100) -> List[Dict]:
         """Get position history for an account."""
-        resp = self.session.get(
+        return self._request_json(
+            "GET",
             f"{self.DATA_API}/position-history",
-            params={"account": account, "limit": limit}
+            params={"account": account, "limit": limit},
         )
-        resp.raise_for_status()
-        return resp.json()
     
     # ==================== MARKETS INFO (Data API) ====================
     
     def get_market_info(self, condition_id: str) -> Dict:
         """Get market info (volume, liquidity, etc.)."""
-        resp = self.session.get(f"{self.DATA_API}/info", params={"conditionId": condition_id})
-        resp.raise_for_status()
-        return resp.json()
+        return self._request_json("GET", f"{self.DATA_API}/info", params={"conditionId": condition_id})
     
     def get_markets_info(self, condition_ids: List[str]) -> Dict[str, Dict]:
         """Get info for multiple markets."""
-        resp = self.session.get(
+        return self._request_json(
+            "GET",
             f"{self.DATA_API}/markets-info",
-            params={"conditionIds": ",".join(condition_ids)}
+            params={"conditionIds": ",".join(condition_ids)},
         )
-        resp.raise_for_status()
-        return resp.json()
     
     def get_volume_history(self, condition_id: str) -> Dict:
         """Get volume history for a market."""
-        resp = self.session.get(f"{self.DATA_API}/volume-history", params={"conditionId": condition_id})
-        resp.raise_for_status()
-        return resp.json()
+        return self._request_json("GET", f"{self.DATA_API}/volume-history", params={"conditionId": condition_id})
     
     # ==================== SUBGRAPH (GraphQL: fills + order events) ====================
 
@@ -582,7 +584,7 @@ class PolymarketClient:
         This is intentionally small: subgraphs are best-effort read-only data
         sources and can occasionally fail.
         """
-        resp = self.session.post(url, json={"query": query, "variables": variables}, timeout=30)
+        resp = self.session.post(url, json={"query": query, "variables": variables}, timeout=self.timeout)
         resp.raise_for_status()
         payload = resp.json()
         if payload.get("errors"):
@@ -786,9 +788,7 @@ class PolymarketClient:
 
     def get_token_info(self, token_id: str) -> Dict:
         """Get token metadata."""
-        resp = self.session.get(f"{self.GAMMA_API}/tokens/{token_id}")
-        resp.raise_for_status()
-        return resp.json()
+        return self._request_json("GET", f"{self.GAMMA_API}/tokens/{token_id}")
     
     def get_candidate_markets(
         self,
@@ -799,9 +799,7 @@ class PolymarketClient:
         params = {"limit": limit}
         if category:
             params["category"] = category
-        resp = self.session.get(f"{self.GAMMA_API}/candidate-markets", params=params)
-        resp.raise_for_status()
-        return resp.json()
+        return self._request_json("GET", f"{self.GAMMA_API}/candidate-markets", params=params)
 
 
     # ==================== COMBINED METHODS (Events + Markets API) ====================

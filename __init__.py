@@ -1,6 +1,10 @@
-"""Local Polymarket helpers package.
+"""Polymarket helpers package (Python).
 
-This exists so imports like:
+Preferred imports:
+  from polymarket import PolymarketClient
   from polymarket.polymarket import PolymarketClient
-work when running scripts from the workspace.
 """
+
+from .polymarket import PolymarketClient, get_client
+
+__all__ = ["PolymarketClient", "get_client"]
