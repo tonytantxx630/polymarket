@@ -438,10 +438,39 @@ class PolymarketClient:
             },
         }
     
-    def get_price(self, token_id: str) -> float:
-        """Get current price for a token."""
-        data = self._request_json("GET", f"{self.CLOB_API}/price", params={"token_id": token_id})
+    def get_price(self, token_id: str, side: str = "BUY") -> float:
+        """Get top-of-book price for a token from the CLOB `/price` endpoint.
+
+        Important (empirically verified):
+          - side="BUY"  returns the **best bid** (price buyers are bidding).
+          - side="SELL" returns the **best ask** (price sellers are asking).
+
+        This naming is easy to misread as "taker action". Treat it as
+        "which side of the book you're querying".
+
+        Args:
+            token_id: CLOB token ID
+            side: "BUY" (best bid) or "SELL" (best ask)
+
+        Returns:
+            price as float-like (may be returned as str by the API).
+        """
+        data = self._request_json(
+            "GET",
+            f"{self.CLOB_API}/price",
+            params={"token_id": token_id, "side": side},
+        )
         return (data or {}).get("price", 0)
+
+    def get_top_of_book(self, token_id: str) -> Dict[str, float]:
+        """Convenience: fetch best bid/ask for `token_id` via `/price`.
+
+        Returns:
+            {"bid": <float>, "ask": <float>}
+        """
+        bid = float(self.get_price(token_id, "BUY") or 0)
+        ask = float(self.get_price(token_id, "SELL") or 0)
+        return {"bid": bid, "ask": ask}
     
     def get_prices(self, token_ids: List[str]) -> Dict[str, float]:
         """Get current prices for multiple tokens."""
@@ -478,7 +507,8 @@ class PolymarketClient:
         Returns empty book if 404 or error.
         """
         try:
-            resp = self.session.get(f"{self.CLOB_API}/orderbook", params={"token_id": token_id}, timeout=self.timeout)
+            # Note: endpoint is /book (not /orderbook)
+            resp = self.session.get(f"{self.CLOB_API}/book", params={"token_id": token_id}, timeout=self.timeout)
             if resp.status_code == 404:
                 return {"bids": [], "asks": [], "error": "Orderbook not available"}
             resp.raise_for_status()
@@ -1006,6 +1036,190 @@ class PolymarketClient:
             category=category
         )
         return markets
+
+    # ==================== SEMANTIC SEARCH + KEYWORD EXPANSION ====================
+    
+    # Keyword synonym mappings for better search recall
+    KEYWORD_SYNONYMS = {
+        "iran": ["iran", "iranian", "tehran", "persian", "persia"],
+        "russia": ["russia", "russian", "moscow", "putin", "kremlin"],
+        "ukraine": ["ukraine", "ukrainian", "kiev", "kyiv"],
+        "china": ["china", "chinese", "beijing", "xi jinping"],
+        "taiwan": ["taiwan", "taiwanese"],
+        "israel": ["israel", "israeli", "tel aviv"],
+        "gaza": ["gaza", "palestine", "palestinian", "hamas"],
+        "election": ["election", "vote", "voting", "ballot", "congress", "senate", "house"],
+        "trump": ["trump", "donald"],
+        "war": ["war", "strike", "attack", "invasion", "military", "conflict", "bombing"],
+        "ceasefire": ["ceasefire", "truce", "peace deal"],
+        "nato": ["nato", "europe", "european union"],
+        "invasive": ["invasive", "regime change", "survive", "collapse", "fall"],
+        "nuclear": ["nuclear", "nukes", "atomic", "uranium", "enrichment"],
+        "oil": ["oil", "energy", "petroleum", "opec", "petrol"],
+        "straithormuz": ["strait of hormuz", "hormuz", "gulf"],
+    }
+    
+    @staticmethod
+    def _expand_keywords(query: str) -> List[str]:
+        """Expand query with synonyms for better search recall.
+        
+        Args:
+            query: Original search query
+            
+        Returns:
+            List of expanded queries (original + synonym variations)
+        """
+        query_lower = query.lower()
+        expansions = [query]  # Start with original
+        
+        # Check each keyword category for matches
+        for category, synonyms in PolymarketClient.KEYWORD_SYNONYMS.items():
+            # Check if any synonym appears in the query
+            for syn in synonyms:
+                if syn in query_lower:
+                    # Add all synonyms from this category as separate searches
+                    for s in synonyms:
+                        if s not in query_lower:
+                            expanded = query_lower.replace(syn, s)
+                            if expanded != query_lower:
+                                expansions.append(expanded)
+                    break
+        
+        # Deduplicate while preserving order
+        seen = set()
+        unique_expansions = []
+        for e in expansions:
+            if e not in seen:
+                seen.add(e)
+                unique_expansions.append(e)
+        
+        return unique_expansions
+    
+    def search_by_topic(
+        self,
+        topic: str,
+        expand_keywords: bool = True,
+        limit_per_query: int = 30,
+        active_only: bool = False,
+        min_volume: float = 0,
+    ) -> Dict[str, Any]:
+        """Semantic search for markets by topic using event grouping + keyword expansion.
+        
+        This method:
+        1. Expands keywords with synonyms (Iran → Iranian, Tehran, Persian)
+        2. Fetches events (which group markets semantically)
+        3. Returns markets grouped by event
+        
+        Args:
+            topic: Topic to search (e.g., "Iran", "Russia Ukraine")
+            expand_keywords: Whether to expand with synonyms
+            limit_per_query: Max markets per query variant
+            active_only: Only return active markets
+            min_volume: Filter by minimum volume
+            
+        Returns:
+            Dict with:
+                - 'events': List of matching events with markets
+                - 'markets': Flat list of all matching markets
+                - 'queries_used': List of queries that were searched
+                - 'summary': Stats
+        """
+        queries = [topic]
+        if expand_keywords:
+            queries = self._expand_keywords(topic)
+        
+        all_events = {}
+        all_markets = []
+        
+        for q in queries:
+            try:
+                # Use public_search which groups by event
+                data = self.public_search(q, limit=limit_per_query)
+                events = data.get("events", [])
+                
+                for event in events:
+                    event_id = event.get("id")
+                    if event_id and event_id not in all_events:
+                        all_events[event_id] = event
+                        
+                        # Extract markets from event
+                        for m in event.get("markets", []):
+                            m["_event_title"] = event.get("title")
+                            m["_event_slug"] = event.get("slug")
+                            m["_search_query"] = q
+                            all_markets.append(m)
+            except Exception as e:
+                print(f"Warning: Search failed for '{q}': {e}")
+                continue
+        
+        # Filter by status
+        if active_only:
+            all_markets = [m for m in all_markets if not m.get("closed")]
+        
+        # Filter by volume
+        if min_volume > 0:
+            all_markets = [m for m in all_markets 
+                          if float(m.get("volume", 0) or 0) >= min_volume]
+        
+        # Build summary
+        active_count = sum(1 for m in all_markets if not m.get("closed"))
+        resolved_count = sum(1 for m in all_markets if m.get("closed"))
+        
+        return {
+            "topic": topic,
+            "queries_used": queries,
+            "events": list(all_events.values()),
+            "markets": all_markets,
+            "summary": {
+                "total_events": len(all_events),
+                "total_markets": len(all_markets),
+                "active_markets": active_count,
+                "resolved_markets": resolved_count,
+            }
+        }
+    
+    def get_events_with_markets(
+        self,
+        category: Optional[str] = None,
+        limit: int = 50,
+        closed: Optional[bool] = None,
+    ) -> List[Dict[str, Any]]:
+        """Get events with their associated markets.
+        
+        Unlike get_events(), this includes the full market data in each event.
+        
+        Args:
+            category: Filter by category
+            limit: Max events to fetch
+            closed: Filter by closed status (None = all)
+            
+        Returns:
+            List of events, each containing 'markets' array
+        """
+        params = {"limit": limit}
+        if category:
+            params["category"] = category
+        if closed is not None:
+            params["closed"] = closed
+        
+        events = self._request_json("GET", f"{self.GAMMA_API}/events", params=params)
+        
+        # For each event, get its markets
+        for event in events:
+            event_id = event.get("id")
+            if event_id:
+                try:
+                    # Fetch markets for this event
+                    markets = self._request_json(
+                        "GET",
+                        f"{self.GAMMA_API}/markets",
+                        params={"eventId": event_id, "limit": 50}
+                    )
+                    event["markets"] = markets
+                except Exception:
+                    event["markets"] = []
+        
+        return events
 
 
 # Convenience function for quick access
