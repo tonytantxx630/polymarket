@@ -3,6 +3,7 @@
 Historical Data Fetcher for Polymarket
 
 Fetches historical market data going back to 2023.
+Logs which endpoint was successful for debugging.
 """
 
 import json
@@ -11,6 +12,11 @@ import os
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional
 from polymarket import PolymarketClient
+
+# Logging setup
+import logging
+logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
+logger = logging.getLogger(__name__)
 
 
 class HistoricalDataFetcher:
@@ -67,20 +73,73 @@ class HistoricalDataFetcher:
         Returns:
             List of {timestamp, price} dicts
         """
-        params = {"interval": "max", "fidelity": 1440}
-        if start_ts:
-            params["startTs"] = start_ts
-        if end_ts:
-            params["endTs"] = end_ts
+        # Try endpoint 1: direct fidelity=1440 (daily)
+        endpoint_used = None
+        try:
+            params = {"interval": "max", "fidelity": 1440}
+            if start_ts:
+                params["startTs"] = start_ts
+            if end_ts:
+                params["endTs"] = end_ts
+            
+            resp = self.client.session.get(
+                f"{self.client.CLOB_API}/prices-history",
+                params={"market": token_id, **params}
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            history = data.get("history", [])
+            
+            if history:
+                endpoint_used = "CLOB /prices-history (fidelity=1440 direct)"
+                logger.info(f"Endpoint successful: {endpoint_used} - got {len(history)} data points")
+                return history
+        except Exception as e:
+            logger.warning(f"Endpoint 1 failed: {e}")
         
-        resp = self.client.session.get(
-            f"{self.client.CLOB_API}/prices-history",
-            params={"market": token_id, **params}
-        )
-        resp.raise_for_status()
-        data = resp.json()
+        # Try endpoint 2: fidelity=60 then resample
+        try:
+            params = {"interval": "max", "fidelity": 60}
+            if start_ts:
+                params["startTs"] = start_ts
+            if end_ts:
+                params["endTs"] = end_ts
+            
+            resp = self.client.session.get(
+                f"{self.client.CLOB_API}/prices-history",
+                params={"market": token_id, **params}
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            raw_history = data.get("history", [])
+            
+            if raw_history:
+                # Resample to daily
+                resampled = self.client._resample_price_history(raw_history, target_fidelity=1440)
+                endpoint_used = "CLOB /prices-history (fidelity=60 + resample to 1440)"
+                logger.info(f"Endpoint successful: {endpoint_used} - got {len(resampled)} data points")
+                return resampled
+        except Exception as e:
+            logger.warning(f"Endpoint 2 failed: {e}")
         
-        return data.get("history", [])
+        # Try endpoint 3: Gamma API tokens endpoint
+        try:
+            resp = self.client.session.get(
+                f"{self.client.GAMMA_API}/tokens/{token_id}",
+                timeout=self.client.timeout
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            # Gamma tokens endpoint might have price history in different format
+            if data and "history" in data:
+                endpoint_used = "Gamma /tokens/{token_id}"
+                logger.info(f"Endpoint successful: {endpoint_used} - got {len(data.get('history', []))} data points")
+                return data.get("history", [])
+        except Exception as e:
+            logger.warning(f"Endpoint 3 failed: {e}")
+        
+        logger.error(f"All endpoints failed for token {token_id}")
+        return []
     
     def fetch_market_prices(
         self,

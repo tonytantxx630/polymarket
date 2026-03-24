@@ -106,9 +106,17 @@ class PolymarketClient:
         return self._request_json("GET", f"{self.GAMMA_API}/markets", params=params)
     
     def get_market(self, condition_id: str) -> Optional[Dict[str, Any]]:
-        """Get single market by condition ID."""
-        data = self._request_json("GET", f"{self.GAMMA_API}/markets", params={"conditionId": condition_id})
-        return data[0] if data else None
+        """Get single market by condition ID.
+
+        Gamma's markets endpoint currently filters by `condition_ids` (underscore),
+        not `conditionId`.
+        """
+        data = self._request_json(
+            "GET",
+            f"{self.GAMMA_API}/markets",
+            params={"condition_ids": condition_id, "limit": 1},
+        )
+        return data[0] if isinstance(data, list) and data else None
     
     def get_market_by_slug(self, slug: str) -> Optional[Dict[str, Any]]:
         """Get market by slug."""
